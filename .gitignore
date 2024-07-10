@@ -1,0 +1,6 @@
+*.ipynb
+time_synced/
+__pycache__/
+figures/
+gui.py 
+registration_gui.py
