@@ -1,0 +1,27 @@
+# conda env create --file environment.yml
+#  gpufit??
+name: im_proc_cpu
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - astra-toolbox           # reconstructions
+  - dask-image
+  - ipympl                  
+  - ipython                 # interactive command-line environment
+  - ipywidgets              # interactive plots in jupyter
+  - jupyterlab
+  - matplotlib
+  - mpi4py
+  - napari                  # n-dimensional data viewer
+  - notebook
+  - numba                   # python function compiler
+  - numpy   
+  - pillow                  # Image reading and writing
+  - pip
+  - scikit-image
+  - scipy
+  - tqdm                    # progress bars
+  - trackpy
+  - pip:
+      - jupyterlab_vim      # this optional
