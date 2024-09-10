@@ -1,34 +1,26 @@
 from PIL import Image 
 from dask_image.imread import imread
 from magicgui import magicgui
-from magicgui.tqdm import tqdm
+from tqdm import tqdm
+from os import mkdir
 from pathlib import Path
-from tifffile import imwrite
 from scipy.optimize import least_squares
+from tifffile import imwrite
+import dask.array as da
 import napari
 import numpy as np
-from os import mkdir
-import dask.array as da
-
-try:
-    import cupy as cp
-    from cupyx.scipy.ndimage import affine_transform, median_filter
-
-    def cp_free_mem() -> None:
-        """
-        Frees cupy's memory pool...
-        """
-        mempool = cp.get_default_memory_pool()
-        mempool.free_all_blocks()
-    def get(arr):
-        return arr.get()
-except ImportError:
-    from scipy.ndimage import affine_transform, median_filter
-    import numpy as cp
-    def cp_free_mem(): pass
-    def get(arr): return arr
+import cupy as cp
+from cupyx.scipy.ndimage import affine_transform, median_filter
+from metavision_core.event_io import EventsIterator
+from metavision_sdk_core import BaseFrameGenerationAlgorithm
 
 
+def cp_free_mem() -> None:
+    """
+    Frees cupy's memory pool...
+    """
+    mempool = cp.get_default_memory_pool()
+    mempool.free_all_blocks()
 
 
 def residual(mat: list, input_pair: np.array, target_pair: np.array) -> np.array:
@@ -63,7 +55,7 @@ def residual(mat: list, input_pair: np.array, target_pair: np.array) -> np.array
     return np.abs(diff).flatten()
 
 
-class registration_gui:
+class spatio_temporal_registration_gui:
     def __init__(self):
         self.viewer = napari.Viewer()
         self.viewer.title = "Event-Frame Registration GUI"
@@ -78,7 +70,7 @@ class registration_gui:
                               self._fit_affine_(),
                               self._apply_transform_(),
                               self._shift_event_(),
-                              self._write_transformed_images_(),
+                              self._write_transforms_(),
                               ]
                         }
         for key,val in dock_widgets.items():
@@ -129,7 +121,13 @@ class registration_gui:
         def inner(batch_size: int = 50):
             event_handle = self.__fetch_layer__("event").data
             frame_handle = self.__fetch_layer__("frame").data
-            nz, nx, ny = frame_handle.shape
+            if frame_handle.ndim == 4:
+                nz, nx, ny, _ = frame_handle.shape
+                frame_ndim = 4
+            elif frame_handle.ndim == 3:
+                nz, nx, ny = frame_handle.shape
+                frame_ndim = 3
+
             _, nx_event, ny_event, _ = event_handle.shape
 
             data_type = event_handle.dtype
@@ -141,7 +139,10 @@ class registration_gui:
             tform_push[1:,1:] = cp.array(self.affine_matrix)
 
             event_raw_transformed = np.zeros([nz,nx,ny,3], dtype = np.uint8)
-            frame_transformed = np.zeros([nz, nx_event, ny_event], dtype = np.float32)
+            if frame_ndim == 3:
+                frame_transformed = np.zeros([nz, nx_event, ny_event], dtype = np.float32)
+            elif frame_ndim == 4:
+                frame_transformed = np.zeros([nz, nx_event, ny_event, 3], dtype = np.uint8)
 
             n_batch = nz // batch_size
             remainder = nz % batch_size
@@ -154,18 +155,28 @@ class registration_gui:
                 local_batch_size = upper_lim - batch_size*q
                 slice_ = slice(q*batch_size, upper_lim)
                 for j in range(3):
-                    event_raw_transformed[slice_,:,:,j] = get(affine_transform(
+                    event_raw_transformed[slice_,:,:,j] = affine_transform(
                         cp.array(event_handle[slice_,:,:,j], dtype = cp.float32),
                         tform_push,
                         output_shape = (local_batch_size,nx,ny),
                         order = 0
-                        ))
-                frame_transformed[slice_] = get(affine_transform(
+                        ).get()
+                    cp_free_mem()
+                    if frame_ndim == 4:
+                        frame_transformed[slice_,:,:,j] = affine_transform(
+                            cp.array(frame_handle[slice_,:,:,j], dtype = cp.float32),
+                            tform_pull,
+                            output_shape = (local_batch_size, nx_event, ny_event),
+                            order = 3
+                                    ).get()
+                        cp_free_mem()
+                if frame_ndim == 3:
+                    frame_transformed[slice_] = affine_transform(
                             cp.array(frame_handle[slice_], dtype = cp.float32),
                             tform_pull,
                             output_shape = (local_batch_size, nx_event, ny_event),
                             order = 3
-                            ))
+                            ).get()
                 cp_free_mem()
 
             self.viewer.add_image(event_raw_transformed, 
@@ -183,21 +194,17 @@ class registration_gui:
     def _flip_ud_(self):
         @magicgui(call_button="flip event ud")
         def inner():
-            for elem in self.viewer.layers:
-                if elem.name == 'event':
-                    elem.data = elem.data[:,::-1]
-                if elem.name == 'event 3 chan':
-                    elem.data = elem.data[:,::-1]
+            handle = self.__fetch_layer__("event")
+            handle.data = handle.data[:,::-1]
+            print("Flipped Event UD")
         return inner
 
     def _flip_lr_(self):
         @magicgui(call_button="flip event lr")
         def inner():
-            for elem in self.viewer.layers:
-                if elem.name == 'event':
-                    elem.data = elem.data[:,:,::-1]
-                if elem.name == 'event 3 chan':
-                    elem.data = elem.data[:,:,::-1]
+            handle = self.__fetch_layer__("event")
+            handle.data = handle.data[:,:,::-1]
+            print("Flipped event LR")
         return inner
 
     def _load_data_(self):
@@ -205,71 +212,108 @@ class registration_gui:
               main_window = True,
               persist = True,
               layout = 'vertical',
-              frame_dir = {"label": "Select Frame Based Directory", 'mode': 'd'},
-              event_dir = {"label": "Select Event Based Directory", 'mode': 'd'},
+              frame_dir = {"label": "Select Frame File (.tif)"},
+              event_dir = {"label": "Select Event File (.raw)"},
                   )
         def inner(
                 frame_dir = Path.home(),
                 event_dir = Path.home(),
                 ):
-            frame_files = (frame_dir / "*.tif").as_posix()
-            event_files = (event_dir / "*.tif").as_posix()
+            self.frame_dir = frame_dir
+            self.event_dir = event_dir
+            frame_files = frame_dir.as_posix()
+            event_files = event_dir.as_posix()
+            self.__extract_folder_metadata__(frame_dir)
             print(event_files)
             print(frame_files)
             frame_stack = imread(frame_files)
-            event_stack = imread(event_files)
-            if frame_stack.ndim == 2:
-                frame_stack = frame_stack[None,:,:]
-            if event_stack.ndim == 2:
-                event_stack = event_stack[None,:,:]
+            event_stack = self._load_raw_to_numpy_(str(event_dir), self.delta_t)
             inst.viewer.add_image(event_stack, colormap = 'gray', name = 'event')
             inst.viewer.add_image(frame_stack, colormap = 'hsv', name = 'frame', opacity = 0.4)
+            self.affine_matrix = None
+            self.pull_affine_matrix = None
         return inner
 
+    def _load_raw_to_numpy_(self, event_file, delta_t):
+        mv_iterator = EventsIterator(
+                event_file,
+                delta_t = delta_t,
+                mode = "delta_t",
+                start_ts = 0,
+                )
+        height,width = mv_iterator.get_size()
+        image_buffer = np.zeros([height, width, 3], dtype = np.uint8)
+        print(delta_t, height, width, image_buffer.shape)
+        images = []
+        for q, ev in tqdm(enumerate(mv_iterator), desc = "raw --> numpy"):
+            BaseFrameGenerationAlgorithm.generate_frame(ev, image_buffer)
+            images.append(image_buffer.copy())
+        return np.stack(images)
+
+    def __extract_folder_metadata__(self, folder_name) -> None:
+        """
+        this method extracts some of the experiment meta data from the file
+        name
+        """
+        components = folder_name.parts
+        for elem in components:
+            if "cytovia" in elem.lower():
+                microscope = 'cytovia'
+                break
+            elif "evanescent" in elem.lower():
+                microscope = 'evanescent'
+                break
+        else:
+            #assert False, "No Microscope in File name"
+            microscope = "unknown_instrument"
+            data_set = "data_set_temp"
+
+        data_set = str(folder_name.name).split(".tif")[0]
+        fps = int(data_set.split("_")[3].split("fps")[0])
+        print("fps = ",fps)
+
+
+        self.microscope = microscope
+        self.dataset = data_set
+        self.fps = fps
+        self.delta_t = int(round(1e6/fps))
+        
     def _diff_frame_(self):
         @magicgui(call_button="Diff Frame")
         def inner(median_kernel: int = 3):
             frame_handle = self.__fetch_layer__("frame").data.copy()
             cp_free_mem()
             temp = cp.diff(cp.array(frame_handle, dtype = cp.float32), axis = 0)
-            temp = get(median_filter(temp, (1,median_kernel, median_kernel)))
+            temp = median_filter(temp, (1,median_kernel, median_kernel)).get()
             cp_free_mem()
             inst.viewer.add_image(temp, name = "diff frame", colormap = "cividis")
         return inner
 
     def _shift_event_(self):
-        @magicgui(call_button="Shift Transformed Temporal",
+        @magicgui(call_button="Shift Event Temporal",
                 shift={'label':'shift','min':-10_000,'max':10_000})
         def inner(shift: int = 0):
-            transformed = self.__fetch_layer__("event -> frame")
+            transformed = self.__fetch_layer__("event")
             transformed.data = np.roll(transformed.data,
                                        shift = shift, 
-                                       axis = 0)
-
-            transformed = self.__fetch_layer__("frame -> event")
-            transformed.data = np.roll(transformed.data,
-                                       shift = -shift, 
                                        axis = 0)
             self.total_shift += shift
         return inner
 
-    def _write_transformed_images_(self):
-        @magicgui(call_button="Write Transformed Event",
-                  out_dir = {"label": "Directory to write to", 'mode': 'd'})
-        def inner(out_dir: Path):
+    def _write_transforms_(self):
+        @magicgui(call_button="Write Transformed Images and data")
+        def inner():
             event_transformed_handle = self.__fetch_layer__("event -> frame").data
             frame_transformed_handle = self.__fetch_layer__("frame -> event").data
+            out_dir = Path("./time_synced") / self.microscope/ self.dataset
             if not out_dir.is_dir():
-                os.mdir(out_dir)
-            mkdir(out_dir / "event_transformed")
-            mkdir(out_dir / "frame_transformed")
+                mkdir(out_dir)
             self.__write_transform_info__(out_dir)
-            nz = event_transformed_handle.shape[0]
-            f_name_frame = out_dir / f"frame_transformed/transformed_frame.tif"
+            f_name_frame = out_dir / f"frame_transformed.tif"
+            f_name_event = out_dir / f"event_transformed.tif"
             imwrite(f_name_frame, frame_transformed_handle)
-            for j in tqdm(range(nz)):
-                f_name_event = out_dir / f"event_transformed/image_{j:06d}.tif"
-                Image.fromarray(event_transformed_handle[j]).save(f_name_event)
+            imwrite(f_name_event, event_transformed_handle)
+            print("Finished Writing Images and Transform Data")
 
         return inner
 
@@ -286,14 +330,44 @@ class registration_gui:
 
     def __write_transform_info__(self, out_directory) -> None:
         """
-        Writes the matrices to np arrays
+        Writes the synchronization info to a csv file (tab delimited)
         """
+        file_name_prefix = f"{self.microscope}_{self.dataset}"
         points = self.__fetch_layer__("Points").data
+        frame_shape  = inst.__fetch_layer__("frame").data.shape
         affine_mat = self.affine_matrix
-        np.save(out_directory / "points_map" , points)
-        np.save(out_directory / "push_affine_matrix", affine_mat)
+        horz_scale = affine_mat[0,0]
+        horz_shear = affine_mat[0,1]
+        horz_translation = affine_mat[0,2]
+        vert_shear = affine_mat[1,0]
+        vert_scale = affine_mat[1,1]
+        vert_translation = affine_mat[1,2]
+        time_0 = -1 * self.total_shift * self.delta_t
+        duration = frame_shape[0] * self.delta_t
+        time_end = time_0 + duration
+        if time_0 < 0:
+            print("WARNING -> BLANK FRAMES NEEDED AT START OF EVENT")
+            frame_0 = self.total_shift
+        else:
+            frame_0 = 0
+        params = {
+                  "path_to_raw":str(self.event_dir),
+                  "path_to_frame":str(self.frame_dir),
+                  "time_init":time_0/1e6,
+                  "time_end":time_end/1e6,
+                  "frame_0":frame_0,
+                  "horz_scale":horz_scale,
+                  "horz_shear":horz_shear,
+                  "horz_translation":horz_translation,
+                  "vert_shear":vert_scale,
+                  "vert_scale":vert_shear,
+                  "vert_translation":vert_translation
+                  }
+        with open(out_directory / f"{file_name_prefix}_sync.csv", 'w') as f:
+            for param, val in params.items():
+                f.write(f"{param}\t{val}\n")
 
 
 if __name__ == "__main__":
-    inst = registration_gui()
+    inst = spatio_temporal_registration_gui()
     napari.run()
