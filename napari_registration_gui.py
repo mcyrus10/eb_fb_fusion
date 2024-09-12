@@ -61,15 +61,18 @@ class spatio_temporal_registration_gui:
         self.viewer.title = "Event-Frame Registration GUI"
         self.pull_affine_matrix = None
         self.affine_matrix = None
+        self.frame_0 = 0
 
         dock_widgets = {
                 'Operations': [self._load_data_(),
                               self._flip_ud_(),
                               self._flip_lr_(),
                               self._diff_frame_(),
+                              self._reset_affine_(),
                               self._fit_affine_(),
                               self._apply_transform_(),
                               self._shift_event_(),
+                              self._set_frame_after_shutter_(),
                               self._write_transforms_(),
                               ]
                         }
@@ -191,6 +194,14 @@ class spatio_temporal_registration_gui:
             self.__fetch_layer__("frame").opacity = 1.0
         return inner
 
+    def _reset_affine_(self):
+        @magicgui(call_button="reset affine")
+        def inner():
+            self.pull_affine_matrix = None
+            self.affine_matrix = None
+            print("Affine Transform set to None")
+        return inner
+
     def _flip_ud_(self):
         @magicgui(call_button="flip event ud")
         def inner():
@@ -250,6 +261,58 @@ class spatio_temporal_registration_gui:
             images.append(image_buffer.copy())
         return np.stack(images)
 
+    def _diff_frame_(self):
+        @magicgui(call_button="Diff Frame")
+        def inner(median_kernel: int = 3):
+            frame_handle = self.__fetch_layer__("frame").data.copy()
+            cp_free_mem()
+            temp = cp.diff(cp.array(frame_handle, dtype = cp.float32), axis = 0)
+            temp = median_filter(temp, (1,median_kernel, median_kernel)).get()
+            cp_free_mem()
+            inst.viewer.add_image(temp, name = "diff frame", colormap = "cividis")
+        return inner
+
+    def _set_frame_after_shutter_(self):
+        """
+        This is a slightly subjective point, but is just for finding the point
+        where the decay is sufficiently significant that the tracking can work
+        properly...
+        """
+        @magicgui(call_button="Set Frame After Shutter",
+                frame_0={'label':'Frame after Shutter','min':0,'max':1e16})
+        def inner(frame_0: int = 0):
+            self.frame_0 = frame_0
+            print(f"first frame set to {self.frame_0}")
+        return inner
+
+    def _shift_event_(self):
+        @magicgui(call_button="Shift Event Temporal",
+                shift={'label':'shift','min':-10_000,'max':10_000})
+        def inner(shift: int = 0):
+            transformed = self.__fetch_layer__("event")
+            transformed.data = np.roll(transformed.data,
+                                       shift = shift, 
+                                       axis = 0)
+            self.total_shift += shift
+        return inner
+
+    def _write_transforms_(self):
+        @magicgui(call_button="Write Transformed Images and data")
+        def inner():
+            event_transformed_handle = self.__fetch_layer__("event -> frame").data
+            frame_transformed_handle = self.__fetch_layer__("frame -> event").data
+            out_dir = Path("./time_synced") / self.microscope/ self.dataset
+            if not out_dir.is_dir():
+                mkdir(out_dir)
+            self.__write_transform_info__(out_dir)
+            f_name_frame = out_dir / f"frame_transformed.tif"
+            f_name_event = out_dir / f"event_transformed.tif"
+            imwrite(f_name_frame, frame_transformed_handle[self.frame_0:])
+            imwrite(f_name_event, event_transformed_handle[self.frame_0:])
+            print("Finished Writing Images and Transform Data")
+
+        return inner
+
     def __extract_folder_metadata__(self, folder_name) -> None:
         """
         this method extracts some of the experiment meta data from the file
@@ -277,45 +340,6 @@ class spatio_temporal_registration_gui:
         self.dataset = data_set
         self.fps = fps
         self.delta_t = int(round(1e6/fps))
-        
-    def _diff_frame_(self):
-        @magicgui(call_button="Diff Frame")
-        def inner(median_kernel: int = 3):
-            frame_handle = self.__fetch_layer__("frame").data.copy()
-            cp_free_mem()
-            temp = cp.diff(cp.array(frame_handle, dtype = cp.float32), axis = 0)
-            temp = median_filter(temp, (1,median_kernel, median_kernel)).get()
-            cp_free_mem()
-            inst.viewer.add_image(temp, name = "diff frame", colormap = "cividis")
-        return inner
-
-    def _shift_event_(self):
-        @magicgui(call_button="Shift Event Temporal",
-                shift={'label':'shift','min':-10_000,'max':10_000})
-        def inner(shift: int = 0):
-            transformed = self.__fetch_layer__("event")
-            transformed.data = np.roll(transformed.data,
-                                       shift = shift, 
-                                       axis = 0)
-            self.total_shift += shift
-        return inner
-
-    def _write_transforms_(self):
-        @magicgui(call_button="Write Transformed Images and data")
-        def inner():
-            event_transformed_handle = self.__fetch_layer__("event -> frame").data
-            frame_transformed_handle = self.__fetch_layer__("frame -> event").data
-            out_dir = Path("./time_synced") / self.microscope/ self.dataset
-            if not out_dir.is_dir():
-                mkdir(out_dir)
-            self.__write_transform_info__(out_dir)
-            f_name_frame = out_dir / f"frame_transformed.tif"
-            f_name_event = out_dir / f"event_transformed.tif"
-            imwrite(f_name_frame, frame_transformed_handle)
-            imwrite(f_name_event, event_transformed_handle)
-            print("Finished Writing Images and Transform Data")
-
-        return inner
 
     def __fetch_layer__(self, layer_name: str):
         """
@@ -342,20 +366,17 @@ class spatio_temporal_registration_gui:
         vert_shear = affine_mat[1,0]
         vert_scale = affine_mat[1,1]
         vert_translation = affine_mat[1,2]
-        time_0 = -1 * self.total_shift * self.delta_t
-        duration = frame_shape[0] * self.delta_t
+        # This is the alignment time could be + or -
+        time_alignment = -1 * self.total_shift * self.delta_t
+        time_0 = time_alignment + self.frame_0 * self.delta_t
+        duration = (frame_shape[0] - self.frame_0) * self.delta_t
         time_end = time_0 + duration
-        if time_0 < 0:
-            print("WARNING -> BLANK FRAMES NEEDED AT START OF EVENT")
-            frame_0 = self.total_shift
-        else:
-            frame_0 = 0
         params = {
                   "path_to_raw":str(self.event_dir),
                   "path_to_frame":str(self.frame_dir),
                   "time_init":time_0/1e6,
                   "time_end":time_end/1e6,
-                  "frame_0":frame_0,
+                  "frame_0":self.frame_0,
                   "horz_scale":horz_scale,
                   "horz_shear":horz_shear,
                   "horz_translation":horz_translation,
@@ -363,6 +384,7 @@ class spatio_temporal_registration_gui:
                   "vert_scale":vert_shear,
                   "vert_translation":vert_translation
                   }
+
         with open(out_directory / f"{file_name_prefix}_sync.csv", 'w') as f:
             for param, val in params.items():
                 f.write(f"{param}\t{val}\n")
