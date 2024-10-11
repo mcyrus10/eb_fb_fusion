@@ -229,9 +229,12 @@ class spatio_temporal_registration_gui:
         def inner(
                 frame_dir = Path.home(),
                 event_dir = Path.home(),
+                fps: int = 0
                 ):
             self.frame_dir = frame_dir
             self.event_dir = event_dir
+            self.delta_t = int(np.round(1e6/fps))
+            print(f"delta_t = {self.delta_t}")
             frame_files = frame_dir.as_posix()
             event_files = event_dir.as_posix()
             self.__extract_folder_metadata__(frame_dir)
@@ -299,16 +302,26 @@ class spatio_temporal_registration_gui:
     def _write_transforms_(self):
         @magicgui(call_button="Write Transformed Images and data")
         def inner():
-            event_transformed_handle = self.__fetch_layer__("event -> frame").data
             frame_transformed_handle = self.__fetch_layer__("frame -> event").data
+            event_transformed_handle = self.__fetch_layer__("event -> frame").data
+            frame_raw_handle = self.__fetch_layer__("frame").data
+            event_raw_handle = self.__fetch_layer__("event").data
             out_dir = Path("./time_synced") / self.microscope/ self.dataset
             if not out_dir.is_dir():
                 mkdir(out_dir)
             self.__write_transform_info__(out_dir)
-            f_name_frame = out_dir / f"frame_transformed.tif"
-            f_name_event = out_dir / f"event_transformed.tif"
-            imwrite(f_name_frame, frame_transformed_handle[self.frame_0:])
-            imwrite(f_name_event, event_transformed_handle[self.frame_0:])
+            # Write The Transformed Image Stacks
+            f_name_frame_tformed = out_dir / f"frame_transformed.tif"
+            f_name_event_tformed = out_dir / f"event_transformed.tif"
+            imwrite(f_name_frame_tformed, frame_transformed_handle[self.frame_0:])
+            imwrite(f_name_event_tformed, event_transformed_handle[self.frame_0:])
+
+            # Write The Untransformed Image Stacks at the synchronization time
+            f_name_frame_raw = out_dir / f"frame_temporal_sync.tif"
+            f_name_event_raw = out_dir / f"event_temporal_sync.tif"
+            end_index = frame_transformed.shape[0]
+            imwrite(f_name_frame_raw, frame_raw_handle[self.frame_0:])
+            imwrite(f_name_event_raw, event_raw_handle[self.frame_0:end_index])
             print("Finished Writing Images and Transform Data")
 
         return inner
