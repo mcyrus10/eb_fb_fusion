@@ -1,12 +1,15 @@
+#!/home/mcd4/miniconda3/envs/openeb/bin/python
 from PIL import Image 
 from dask_image.imread import imread
 from magicgui import magicgui
+from napari.qt.threading import thread_worker
 from tqdm import tqdm
 from os import mkdir
 from pathlib import Path
 from scipy.optimize import least_squares
 from tifffile import imwrite
 import dask.array as da
+import trackpy as tp
 import napari
 import numpy as np
 import cupy as cp
@@ -62,9 +65,10 @@ class spatio_temporal_registration_gui:
         self.pull_affine_matrix = None
         self.affine_matrix = None
         self.frame_0 = 0
+        self.track_bool = False
 
         dock_widgets = {
-                'Operations': [self._load_data_(),
+                'Registration Ops': [self._load_data_(),
                               self._flip_ud_(),
                               self._flip_lr_(),
                               self._diff_frame_(),
@@ -74,14 +78,25 @@ class spatio_temporal_registration_gui:
                               self._shift_event_(),
                               self._set_frame_after_shutter_(),
                               self._write_transforms_(),
+                              ],
+                'Tracking Ops':[
+                            self._preview_track_centroids_(),
+                            self._track_()
                               ]
-                        }
-        for key,val in dock_widgets.items():
-            self.viewer.window.add_dock_widget(val,
+                }
+        tabs = []
+        for j,(key,val) in enumerate(dock_widgets.items()):
+            handle = self.viewer.window.add_dock_widget(val,
                                                name = key,
                                                add_vertical_stretch = False,
                                                area = 'right'
                                                )
+            tabs.append(handle)
+            if j > 0:
+                self.viewer.window._qt_window.tabifyDockWidget(
+                        tabs[0],
+                        handle
+                        )
         self.total_shift = 0
 
     def _fit_affine_(self):
@@ -243,7 +258,8 @@ class spatio_temporal_registration_gui:
             frame_stack = imread(frame_files)
             event_stack = self._load_raw_to_numpy_(str(event_dir), self.delta_t)
             inst.viewer.add_image(event_stack, colormap = 'gray', name = 'event')
-            inst.viewer.add_image(frame_stack, colormap = 'hsv', name = 'frame', opacity = 0.4)
+            inst.viewer.add_image(frame_stack, colormap = 'hsv',
+                                    name = 'frame', opacity = 0.4)
             self.affine_matrix = None
             self.pull_affine_matrix = None
         return inner
@@ -401,6 +417,93 @@ class spatio_temporal_registration_gui:
         with open(out_directory / f"{file_name_prefix}_sync.csv", 'w') as f:
             for param, val in params.items():
                 f.write(f"{param}\t{val}\n")
+
+    def _preview_track_centroids_(self):
+        @magicgui(call_button="Locate Centroids",
+                layer_name = {'label':'Layer Name'},
+                minmass = {'label':'minmass', 'max': 1e16},
+                diameter = {'label':'Diameter', 'max': 1e16},
+                test_frame = {'label':'Test Frame', 'max': 1e16}
+                )
+        def inner(
+                layer_name: str,
+                minmass: float,
+                diameter: int,
+                test_frame: int
+                ):
+            track_handle = self.__fetch_layer__(layer_name).data[test_frame].copy()
+            if track_handle.ndim == 3:
+                print("--> not sure what to do for 4d images?")
+                track_handle = np.sum(track_handle.astype(np.float32), axis = -1)
+                pass
+            elif track_handle.ndim == 2:
+                pass
+            self.track_dict = {
+                    "minmass":minmass,
+                    "diameter": diameter,
+                    }
+            self.track_bool = True
+            print(type(track_handle))
+            f = tp.locate(
+                          np.array(track_handle),
+                          diameter,
+                          minmass = minmass,
+                          invert = False)
+            points_array = f[['y','x']].values
+            self.viewer.add_points(
+                    points_array,
+                    name = f'tracked centroids {test_frame}',
+                    symbol = 'x',
+                    face_color = 'b'
+                    )
+        return inner
+
+    def _track_(self):
+        @magicgui(call_button="Track Particles",
+                layer_name = {'label':'Layer Name'},
+                min_length = {'label':'Filter Stub Length', 'max': 1e16},
+                search_range = {'label':'Search Range', 'max': 1e16},
+                )
+        def inner(
+                layer_name: str,
+                min_length: int,
+                search_range: int,
+                ):
+            assert self.track_bool, ("Set the tracking parameters with "
+                                     "'preview' before tracking")
+            minmass = self.track_dict['minmass']
+            diameter = self.track_dict['diameter']
+            track_handle = self.__fetch_layer__(layer_name).data.copy()
+            if track_handle.ndim == 4:
+                print("--> not sure what to do for 4d images?")
+                track_handle = np.sum(track_handle.astype(np.float32), axis = -1)
+                pass
+            elif track_handle.ndim == 3:
+                pass
+            f = tp.batch(np.array(track_handle, dtype = np.float32), 
+                         diameter = diameter,
+                         minmass = minmass)
+            t = tp.link(f, search_range = search_range)
+            print(t.head)
+            t1 = tp.filter_stubs(t, min_length)
+            self.tracks = t1.copy()
+            # Add Track Centroids to viewer as points layer
+            slice_handle = ['frame','y','x']
+            self.viewer.add_points(t1[slice_handle], 
+                                   name = "tracked centroids",
+                                   face_color = 'k')
+
+            # Add Tracks to viewer as path (frame agnostic)
+            tracks = []
+            for particle in self.tracks['particle'].unique():
+                slice_ = self.tracks['particle'] == particle
+                tracks.append(self.tracks[['y','x']][slice_])
+            self.viewer.add_shapes(tracks, name = "Tracks", shape_type = "path")
+
+        return inner
+
+    def _calc_msd_(self):
+        pass
 
 
 if __name__ == "__main__":
