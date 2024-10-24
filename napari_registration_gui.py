@@ -1,21 +1,34 @@
 #!/home/mcd4/miniconda3/envs/openeb/bin/python
 from PIL import Image 
+from cupyx.scipy.ndimage import affine_transform, median_filter, gaussian_filter
 from dask_image.imread import imread
 from magicgui import magicgui
+from metavision_core.event_io import EventsIterator
+from metavision_sdk_core import BaseFrameGenerationAlgorithm
 from napari.qt.threading import thread_worker
-from tqdm import tqdm
 from os import mkdir
 from pathlib import Path
 from scipy.optimize import least_squares
 from tifffile import imwrite
+from tqdm import tqdm
+import cupy as cp
+import diffusive_distinguishability.ndim_homogeneous_distinguishability as hd
 import dask.array as da
-import trackpy as tp
+import imgrvt as rvt
+import matplotlib.pyplot as plt
 import napari
 import numpy as np
-import cupy as cp
-from cupyx.scipy.ndimage import affine_transform, median_filter
-from metavision_core.event_io import EventsIterator
-from metavision_sdk_core import BaseFrameGenerationAlgorithm
+import pandas as pd
+import trackpy as tp
+import h5py
+import gc
+
+
+from sys import path
+path.append("/home/mcd4/cy_im_utils")
+from cy_im_utils.imgrvt_cuda import rvt
+from cy_im_utils.event.trackpy_utils import imsd_powerlaw_fit, imsd_linear_fit
+from cy_im_utils.parametric_fits import parametric_gaussian, fit_param_gaussian
 
 
 def cp_free_mem() -> None:
@@ -66,12 +79,14 @@ class spatio_temporal_registration_gui:
         self.affine_matrix = None
         self.frame_0 = 0
         self.track_bool = False
+        self.track_holder = {}
 
         dock_widgets = {
                 'Registration Ops': [self._load_data_(),
                               self._flip_ud_(),
                               self._flip_lr_(),
-                              self._diff_frame_(),
+                              self._diff_layer_(),
+                              self._load_affine_mat_(),
                               self._reset_affine_(),
                               self._fit_affine_(),
                               self._apply_transform_(),
@@ -79,10 +94,22 @@ class spatio_temporal_registration_gui:
                               self._set_frame_after_shutter_(),
                               self._write_transforms_(),
                               ],
+                'Filtering':[
+                            self._isolate_event_channels_(),
+                            self._combine_event_channels_(),
+                            self._tform_event_to_rvt_(),
+                            self._apply_gaussian_layer_(),
+                            self._apply_median_layer_(),
+
+                ],
                 'Tracking Ops':[
                             self._preview_track_centroids_(),
-                            self._track_()
-                              ]
+                            self._track_(),
+                            self._calc_msd_()
+                              ],
+                'Utils':[
+                    self._free_memory_(),
+                    ]
                 }
         tabs = []
         for j,(key,val) in enumerate(dock_widgets.items()):
@@ -98,6 +125,29 @@ class spatio_temporal_registration_gui:
                         handle
                         )
         self.total_shift = 0
+
+    def _free_memory_(self):
+        @magicgui(
+                call_button="Free Memory",
+                )
+        def inner():
+            cp_free_mem()
+            gc.collect()
+            print("CUDA memory freed and Garbage Collected")
+        return inner
+
+    def _load_affine_mat_(self):
+        @magicgui(
+                call_button="Load affine transform",
+                persist = True,
+                f_name = {'label': "Affine Transform File Name (.npy)"}
+                )
+        def inner(f_name: Path):
+            affine = np.load(f_name)
+            self.affine_matrix = affine
+            self.pull_affine_matrix = np.linalg.inv(affine)
+            print("Loaded Affine Matrix From File")
+        return inner
 
     def _fit_affine_(self):
         @magicgui(call_button="Fit/Refit Affine Params")
@@ -239,30 +289,94 @@ class spatio_temporal_registration_gui:
               persist = True,
               layout = 'vertical',
               frame_dir = {"label": "Select Frame File (.tif)"},
-              event_dir = {"label": "Select Event File (.raw)"},
+              load_frame_bool = {"label": "Load Frame"},
+              event_dir = {"label": "Select Event File (.raw or .hdf5)"},
+              load_event_bool = {"label": "Load Event"},
+              fps = {'label': "FPS (0 for hdf5 trigger sync)"}
                   )
         def inner(
-                frame_dir = Path.home(),
-                event_dir = Path.home(),
+                frame_dir: Path = Path.home(),
+                load_frame_bool: bool = True,
+                event_dir: Path = Path.home(),
+                load_event_bool: bool = True,
                 fps: int = 0
                 ):
             self.frame_dir = frame_dir
             self.event_dir = event_dir
-            self.delta_t = int(np.round(1e6/fps))
-            print(f"delta_t = {self.delta_t}")
-            frame_files = frame_dir.as_posix()
-            event_files = event_dir.as_posix()
-            self.__extract_folder_metadata__(frame_dir)
-            print(event_files)
-            print(frame_files)
-            frame_stack = imread(frame_files)
-            event_stack = self._load_raw_to_numpy_(str(event_dir), self.delta_t)
-            inst.viewer.add_image(event_stack, colormap = 'gray', name = 'event')
-            inst.viewer.add_image(frame_stack, colormap = 'hsv',
+            if load_event_bool:
+                event_files = event_dir.as_posix()
+                print(event_files)
+                # Read a .raw or .hdf5
+                event_suffix = event_dir.suffix
+                if event_suffix == '.raw':
+                    self.delta_t = int(np.round(1e6/fps))
+                    print(f"fps: {fps}\tdelta t: {self.delta_t} us")
+                    print("Reading .raw file")
+                    event_stack = self._load_raw_to_numpy_(str(event_dir), 
+                                                           self.delta_t)
+                elif event_suffix == '.hdf5':
+                    print("Reading .hdf5 file and matching triggers to exposures")
+                    event_stack = self._load_hdf5_to_numpy_(str(event_dir))
+
+                inst.viewer.add_image(event_stack, colormap = 'gray', 
+                                      name = 'event')
+
+            if load_frame_bool:
+                frame_files = frame_dir.as_posix()
+                print(frame_files)
+                frame_stack = imread(frame_files)
+                inst.viewer.add_image(frame_stack, colormap = 'hsv',
                                     name = 'frame', opacity = 0.4)
-            self.affine_matrix = None
-            self.pull_affine_matrix = None
+
         return inner
+
+    def _load_hdf5_to_numpy_(self, event_file, mode = 'exposure') -> np.array:
+        """
+        This is for loading in an hdf5 file so that the exposure time of the
+        frame camera can be matched to the event signal directly.....
+        
+        Just use the regular raw -> numpy function if you want a finer frame
+        rate sampling since this will load the data with gaps!!!
+        (discontinuous event data)
+        """
+        with h5py.File(event_file, "r") as f:
+            data = f['CD']['events'][()]
+            trigger_data = f['EXT_TRIGGER']['events'][()]
+
+        cp_free_mem()
+        x, y, t = [cp.array(data[key], dtype = data[key].dtype) for key in ['x','y','t']]
+        trigger_time = cp.array(trigger_data['t'], dtype = trigger_data['t'].dtype)
+        trigger_0 = trigger_data['p'][0]
+        if trigger_0 == 0:
+            print("Shifting to first trigger on state")
+            trigger_time = trigger_time[1:]
+
+        n_trigger = trigger_time.shape[0]
+        if n_trigger % 2 != 0:
+            print("Odd number of triggers, subtracting one off")
+            n_trigger -= 1
+        image_stack = []
+        pos_polarity = cp.array(data['p'] > 0, dtype = bool)
+        pos_val = cp.array([255,255,255], dtype = cp.uint8 )
+        neg_val = cp.array([200,126,64], dtype = cp.uint8 )
+        void_val = cp.array([52,37,30], dtype = cp.uint8)
+        #if trigger_time[0]
+        #plt.figure()
+        #plt.plot(trigger_data['t'], trigger_data['p'])
+        #plt.show()
+        for j in tqdm(range(n_trigger), desc = 'reading hdf5 events'):
+            if j % 2 != 0:
+                continue
+            slice_ = (t >= trigger_time[j]) * (t <= trigger_time[j+1])
+            image_holder = cp.full([720,1280,3], void_val)
+            for fill, polarity in zip([pos_val, neg_val],[pos_polarity, ~pos_polarity]):
+                local_slice = slice_ * polarity
+                x_local = x[local_slice]
+                y_local = y[local_slice]
+                image_holder[y_local, x_local] = fill
+            image_stack.append(image_holder.get().copy())
+        image_stack = np.stack(image_stack)
+        return image_stack
 
     def _load_raw_to_numpy_(self, event_file, delta_t):
         mv_iterator = EventsIterator(
@@ -280,15 +394,27 @@ class spatio_temporal_registration_gui:
             images.append(image_buffer.copy())
         return np.stack(images)
 
-    def _diff_frame_(self):
-        @magicgui(call_button="Diff Frame")
-        def inner(median_kernel: int = 3):
-            frame_handle = self.__fetch_layer__("frame").data.copy()
+    def _diff_layer_(self):
+        @magicgui(call_button="Diff Layer")
+        def inner(
+                layer_name: str = "frame",
+                median_kernel: int = 3,
+                ):
+            frame_handle = self.__fetch_layer__(layer_name).data
             cp_free_mem()
-            temp = cp.diff(cp.array(frame_handle, dtype = cp.float32), axis = 0)
-            temp = median_filter(temp, (1,median_kernel, median_kernel)).get()
+            n_frames = frame_handle.shape[0]
+            kernel = (1, median_kernel, median_kernel)
+            output = np.zeros(frame_handle.shape, dtype = np.float32)
+            print(n_frames, type(n_frames))
+            for j in tqdm(range(n_frames-1), desc = "diff frame"):
+                slice_ = slice(j,j+2)
+                cp_arr = cp.array(frame_handle[slice_], dtype = cp.float32)
+                cp_arr = median_filter(cp_arr, kernel)
+                diff = cp_arr[1] - cp_arr[0]
+                output[j] = diff.get()
             cp_free_mem()
-            inst.viewer.add_image(temp, name = "diff frame", colormap = "cividis")
+            inst.viewer.add_image(output[:-1], name = "diff frame",
+                    colormap = "hsv")
         return inner
 
     def _set_frame_after_shutter_(self):
@@ -347,6 +473,7 @@ class spatio_temporal_registration_gui:
         this method extracts some of the experiment meta data from the file
         name
         """
+        print("-----------> DEPRECATED FUNCTIONALITY")
         components = folder_name.parts
         for elem in components:
             if "cytovia" in elem.lower():
@@ -463,11 +590,13 @@ class spatio_temporal_registration_gui:
                 layer_name = {'label':'Layer Name'},
                 min_length = {'label':'Filter Stub Length', 'max': 1e16},
                 search_range = {'label':'Search Range', 'max': 1e16},
+                memory = {'label':'memory', 'max': 1e16},
                 )
         def inner(
                 layer_name: str,
                 min_length: int,
                 search_range: int,
+                memory: int,
                 ):
             assert self.track_bool, ("Set the tracking parameters with "
                                      "'preview' before tracking")
@@ -483,27 +612,329 @@ class spatio_temporal_registration_gui:
             f = tp.batch(np.array(track_handle, dtype = np.float32), 
                          diameter = diameter,
                          minmass = minmass)
-            t = tp.link(f, search_range = search_range)
+            t = tp.link(f, search_range = search_range, memory = memory)
             print(t.head)
             t1 = tp.filter_stubs(t, min_length)
-            self.tracks = t1.copy()
+            self.track_holder[layer_name] = t1.copy()
             # Add Track Centroids to viewer as points layer
             slice_handle = ['frame','y','x']
             self.viewer.add_points(t1[slice_handle], 
                                    name = "tracked centroids",
                                    face_color = 'k')
 
-            # Add Tracks to viewer as path (frame agnostic)
-            tracks = []
-            for particle in self.tracks['particle'].unique():
-                slice_ = self.tracks['particle'] == particle
-                tracks.append(self.tracks[['y','x']][slice_])
-            self.viewer.add_shapes(tracks, name = "Tracks", shape_type = "path")
+            self.viewer.add_tracks(t1[['particle','frame','y','x']])
 
         return inner
 
+    def _tform_event_to_rvt_(self):
+        @magicgui(
+                call_button="Apply RVT",
+                layer_name = {'label':'Layer Name'},
+                rmin = {'label':'R Min', 'max': 1e16},
+                rmax = {'label':'R Max', 'max': 1e16},
+                )
+        def inner(
+                layer_name: str,
+                rmin: int,
+                rmax: int,
+                ):
+            layer_handle = self.__fetch_layer__(layer_name).data
+            assert layer_handle.ndim == 3, "RVT only works for 3d image stacks"
+            n_im = layer_handle.shape[0]
+            temp = np.zeros_like(layer_handle).astype(np.float32)
+            for j in tqdm(range(n_im), desc = "applying rvt"):
+                cp_arr = cp.array(layer_handle[j], dtype = np.float32)
+                temp[j] = rvt(cp_arr, rmin = rmin, rmax = rmax).get()
+            self.viewer.add_image(temp, name = f'{layer_name} RVT' )
+        return inner
+
+    def __calc_bayesian__(self, track_id, track_handle, fps, mpp) -> np.array:
+        particle_slice = track_handle['particle'] == track_id
+        # Convert displacement from pixels to nm?
+        dx = np.diff(track_handle['x'][particle_slice].values) * mpp
+        dy = np.diff(track_handle['y'][particle_slice].values) * mpp
+        dr = (dx**2+dy**2)**(1/2)
+        posterior, alpha, beta = hd.estimate_diffusion(
+                n_dim = 2,
+                dt = 1 / fps,
+                dr = dr
+                )
+        bay_diffusivity = np.array([posterior.mean(), posterior.std()])
+
+        return bay_diffusivity
+
     def _calc_msd_(self):
-        pass
+        @magicgui(
+                call_button="Calculate MSD and Bayesian Diam",
+                track_id = {'label':'Track ID (-1 for all tracks)', 'min':-1, 'max': 1e16},
+                fps = {'label':'fps', 'max': 1e16},
+                mpp = {'label':'micron per pixel', 'max': 1e16, 'step': 1e-4},
+                msd_point_min = {'label': 'msd fit idx min', 'max': 1e16},
+                msd_point_max = {'label': 'msd fit idx max', 'max': 1e16},
+                max_lagtime = {'label': 'max lagtime', 'max': 1e16},
+                temperature = {'label': 'Temperature (K)', 'max': 1e16},
+                viscosity = {'label': 'Viscosity (pa * s)', 'min':1e-16, 
+                             'max': 1e16, 'step':1e-4},
+                bins = {'label': 'histogram bins', 'min':1e-16, 'max': 1e16},
+                track_key = {'label': 'Track Key (dict)'}
+
+                )
+        def inner(
+                fps: float,
+                mpp: float,
+                track_key: str,
+                track_id: int = -1,
+                msd_point_min: int = 0,
+                msd_point_max: int = 5,
+                max_lagtime: int = 100,
+                temperature: float = 295.0,
+                viscosity: float = 0.001,
+                bins: int = 50
+                ):
+            T = temperature
+            eta = viscosity
+            imsd_kwargs = {'mpp':mpp, 'fps':fps, 'max_lagtime': max_lagtime}
+            track_handle = self.track_holder[track_key]
+            if track_id == -1:
+                print("calculating all tracks")
+                imsd = tp.motion.imsd(track_handle, **imsd_kwargs)
+                bay = []
+                for elem in track_handle['particle'].unique():
+                    bay.append(self.__calc_bayesian__(elem, track_handle, fps, mpp))
+                bay = np.vstack(bay)
+                print("--> bay shape all elements:",bay.shape)
+            else:
+                print(f"calculating {track_id}")
+                particle_slice = track_handle['particle'] == track_id
+                if particle_slice.values.sum() == 0:
+                    assert False, f"Empty Particle ID {track_id}"
+                imsd = tp.motion.imsd(track_handle[particle_slice], **imsd_kwargs)
+                bay = self.__calc_bayesian__(track_id, track_handle, fps, mpp)[None,:]
+                print("--> bay shape 1 element:",bay.shape)
+
+            # Instance's imsd
+            self.imsd = imsd
+
+            # Log-Log Fit
+            A,n_log,log_fits = imsd_powerlaw_fit(imsd, start_index = msd_point_min,
+                                              end_index = msd_point_max)
+
+            # Linear Fit
+            m,b,lin_fits = imsd_linear_fit(imsd, start_index = msd_point_min,
+                                              end_index = msd_point_max)
+
+
+            # Remove negative slopes from analysis....
+            #remove_neg_slopes = m > 0
+            #n_neg = np.sum(remove_neg_slopes)
+            #if n_neg > 0:
+            #    print(f"Removing {n_neg} trajectories...")
+            #m = m[remove_neg_slopes]
+            #b = b[remove_neg_slopes]
+            #lin_fits = lin_fits[remove_neg_slopes]
+
+            # COMPOSE FIGURE
+            fig,ax = plt.subplots(2,3, figsize = (10,10))
+            for a in ax[0]:
+                a.plot(imsd.index, imsd, color = 'k', alpha = 0.05, 
+                       marker = '.', linestyle = '')
+
+                a.set(xlabel = "Lag time (s)", 
+                      ylabel = r"$\langle \Delta r^2 \rangle$ [$\mu$m$^2$]")
+            slice_ = slice(msd_point_min, msd_point_max)
+            ax[0,0].set(xscale = 'log', yscale = 'log')
+            ax[0,0].plot(imsd.index.values[slice_], log_fits, color = 'r', alpha = 0.05)
+            ax[0,1].plot(imsd.index.values[slice_], lin_fits, color = 'r', alpha = 0.05)
+            kb = 1.38e-23
+            D_log = np.exp(A)/4
+            diam_log = kb * T / (3 * np.pi * eta * D_log * 1e-12) * 1e9
+            D_lin = m/4
+            diam_lin = kb * T / (3 * np.pi * eta * D_lin * 1e-12) * 1e9
+            for j, arr in enumerate([n_log, diam_lin]):
+                # Stats for the entire Population
+                mean_local = np.nanmean(arr)
+                std_local = np.nanstd(arr)
+                cv_local = 100 * std_local / mean_local
+                label_local = f"mean:{mean_local:0.2f}\nstd:{std_local:0.2f}\nCV: {cv_local:0.2f} %"
+                ax[1,j].axvline(mean_local, label = label_local, color = 'k', 
+                                linestyle = '--')
+
+                med_local = np.nanmedian(arr)
+                ax[1,j].axvline(med_local,
+                                label = f"median: {med_local:0.2f}", 
+                                color = 'b', 
+                                linestyle = '--')
+
+
+            # Gaussian Fits 
+            gaussian_fit_linear = fit_param_gaussian(diam_lin, n_bins = bins, 
+                                                     mode = 'normal')
+            gaussian_fit_log = fit_param_gaussian(diam_log, n_bins = bins, 
+                                                     mode = 'normal')
+
+            bay_diam = kb * T / (3 * np.pi * eta * bay[:,0] * 1e-12) * 1e9
+            gaussian_fit_bay = fit_param_gaussian(bay_diam, n_bins = bins, 
+                                                     mode = 'normal')
+
+
+            if gaussian_fit_log is not None:
+                bins_centered, counts, log_gaussian_fit = gaussian_fit_log
+                x_local = np.exp(
+                        np.linspace(bins_centered[0], bins_centered[-1], 1000))
+                ax[1,0].plot(x_local, np.exp(parametric_gaussian(x_local, log_gaussian_fit)))
+            else:
+                print("---> ERROR WITH GAUSSIAN FITTING")
+
+            if gaussian_fit_linear is not None:
+                bins_centered, counts, lin_gaussian_fit = gaussian_fit_linear
+                x_local = np.linspace(bins_centered[0], bins_centered[-1], 1000)
+                ax[1,1].plot(x_local, 
+                             parametric_gaussian(x_local, lin_gaussian_fit),
+                             )
+                _, mean_, std_, _ = lin_gaussian_fit
+                cv_ = 100 * std_ / mean_
+                print(mean_, std_, cv_)
+                ax[1,1].axvline(mean_, color = 'r', 
+                        label = f"mean: {mean_:0.2f}\nstd:{std_:0.2f}\ncv: {cv_:0.2f}%")
+            else:
+                print("---> ERROR WITH GAUSSIAN FITTING OF LINEAR DIAMETERS")
+
+            if gaussian_fit_bay is not None:
+                bins_centered, counts, lin_gaussian_bay = gaussian_fit_bay
+                x_local = np.linspace(bins_centered[0], bins_centered[-1], 1000)
+                ax[1,2].plot(x_local, 
+                             parametric_gaussian(x_local, lin_gaussian_bay),
+                             )
+                _, mean_, std_, _ = lin_gaussian_bay
+                cv_ = 100 * std_ / mean_
+                print(mean_, std_, cv_)
+                ax[1,2].axvline(mean_, color = 'r', 
+                        label = f"bay\nmean: {mean_:0.2f}\nstd:{std_:0.2f}\ncv: {cv_:0.2f}%")
+            else:
+                print("---> ERROR WITH GAUSSIAN FITTING OF Bayesian DIAMETERS")
+
+
+            _ = ax[1,0].hist(diam_log, bins = bins)
+            _ = ax[1,1].hist(diam_lin, bins = bins)
+            for a in ax[1]:
+                a.legend()
+                a.set_xlabel("Particle Diameter (nm)")
+
+            bay_diam = kb * T / (3 * np.pi * eta * bay[:,0] * 1e-12) * 1e9
+            ax[1,2].hist(bay_diam, bins = bins)
+            fig.tight_layout()
+            f_name = "/tmp/_delete_me_.png"
+            fig.savefig(f_name, dpi = 200)
+            self.viewer.add_image(np.asarray(Image.open(f_name)), 
+                                name = f"msd {track_id}")
+            
+        return inner
+
+    def _apply_gaussian_layer_(self):
+        @magicgui(
+                call_button="Apply 2D Gaussian Filter",
+                layer_name = {'label':'Layer Name'},
+                sigma = {'label':'sigma','max': 100.0}
+                )
+        def inner(
+                layer_name: str,
+                sigma: float = 0.0,
+                ):
+            layer_handle = self.__fetch_layer__(layer_name).data
+            assert layer_handle.ndim == 3, "Gaussian sigma only works for 3d image stacks"
+            n_im = layer_handle.shape[0]
+            temp = np.zeros_like(layer_handle).astype(np.float32)
+            for j in tqdm(range(n_im), desc = "applying gaussian filter"):
+                cp_arr = cp.array(layer_handle[j], dtype = np.float32)
+                temp[j] = gaussian_filter(cp_arr, sigma = sigma).get()
+            self.viewer.add_image(temp, name = f'{layer_name} Gaussian Filtered' )
+        return inner
+
+    def _apply_median_layer_(self):
+        @magicgui(
+                call_button="Apply 2D Median Filter",
+                layer_name = {'label':'Layer Name'},
+                kernel = {'label':'kernel size','max': 100, "step": 2 }
+                )
+        def inner(
+                layer_name: str,
+                kernel: int = 3
+                ):
+            layer_handle = self.__fetch_layer__(layer_name).data
+            assert layer_handle.ndim == 3, "median_filter only works for 3d image stacks"
+            n_im = layer_handle.shape[0]
+            temp = np.zeros_like(layer_handle).astype(np.float32)
+            for j in tqdm(range(n_im), desc = "applying median_filter"):
+                cp_arr = cp.array(layer_handle[j], dtype = np.float32)
+                temp[j] = median_filter(cp_arr, (kernel,kernel)).get()
+            self.viewer.add_image(temp, name = f'{layer_name} Median Filtered' )
+        return inner
+
+    def _convert_event_to_grayscale_(self):
+        @magicgui(
+                call_button="Apply 2D Median Filter",
+                layer_name = {'label':'Layer Name'},
+                kernel = {'label':'kernel size','max': 100, "step": 2 }
+                )
+        def inner(
+                layer_name: str,
+                kernel: int = 3
+                ):
+            layer_handle = self.__fetch_layer__(layer_name).data
+            assert layer_handle.ndim == 3, "median_filter only works for 3d image stacks"
+            n_im = layer_handle.shape[0]
+            temp = np.zeros_like(layer_handle).astype(np.float32)
+            for j in tqdm(range(n_im), desc = "applying median_filter"):
+                cp_arr = cp.array(layer_handle[j], dtype = np.float32)
+                temp[j] = median_filter(cp_arr, (kernel,kernel)).get()
+            self.viewer.add_image(temp, name = f'{layer_name} Median Filtered' )
+        return inner
+
+    def _isolate_event_channels_(self):
+        @magicgui(
+                call_button="Isolate Event Channels",
+                )
+        def inner(
+                layer_name: str = 'event',
+                ):
+            layer_handle = self.__fetch_layer__(layer_name).data
+            assert layer_handle.ndim == 4, "needs 4 channel event data..."
+            nz,nx,ny,_ = layer_handle.shape
+            out_pos = np.zeros([nz,nx,ny], dtype = np.uint8)
+            out_neg = np.zeros([nz,nx,ny], dtype = np.uint8)
+            pos = cp.array([255,255,255], dtype = np.uint8)
+            neg = cp.array([200,126,64], dtype = np.uint8)
+            print("Hard Coded Positive and Negative polarities:")
+            print(f"\tPositive: {pos})")
+            print(f"\tNegative: {neg})")
+            for j in tqdm(range(nz)):
+                cp_arr = cp.array(layer_handle[j], dtype = cp.uint8)
+                out_pos[j] = 255*cp.prod(cp_arr == pos, axis = -1).astype(cp.uint8).get()
+                out_neg[j] = 255*cp.prod(cp_arr == neg, axis = -1).astype(cp.uint8).get()
+            self.viewer.add_image(out_pos, name = "positive", colormap = 'bop purple')
+            self.viewer.add_image(out_neg, name = "negative", colormap = 'bop orange')
+        return inner
+
+    def _combine_event_channels_(self):
+        @magicgui(
+                call_button="|Event| -> grayscale",
+                )
+        def inner(
+                layer_name: str = 'event',
+                ):
+            layer_handle = self.__fetch_layer__(layer_name).data
+            assert layer_handle.ndim == 4, "needs 4 channel event data..."
+            nz,nx,ny,_ = layer_handle.shape
+            out_pos = np.zeros([nz,nx,ny], dtype = np.uint8)
+            out_neg = np.zeros([nz,nx,ny], dtype = np.uint8)
+            none_val = cp.array([52,37,30], dtype = np.uint8)
+            print("Hard Coded VOID polarities:")
+            print(f"\tvoid polarity: {none_val})")
+            for j in tqdm(range(nz)):
+                cp_arr = cp.array(layer_handle[j], dtype = cp.uint8)
+                out_pos[j] = 255*cp.prod(cp_arr != none_val, axis = -1).astype(cp.uint8).get()
+            self.viewer.add_image(out_pos, name = "event combined", colormap = 'gray')
+        return inner
 
 
 if __name__ == "__main__":
